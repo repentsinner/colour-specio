@@ -7,16 +7,18 @@ import platform
 import textwrap
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum, IntEnum
+from enum import Enum
 from functools import cached_property
 from types import MappingProxyType
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import serial
 import serial.tools.list_ports
 from aenum import MultiValueEnum
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __version__ = "0.4.1.post0"
 __author__ = "Tucker Downs"
@@ -142,19 +144,19 @@ class ResponseCode(int, Enum):
 
     RESERVED = -999
 
-    def __new__(cls, value: int, *value_aliases: int) -> Self: # type: ignore
+    def __new__(cls, value: int, *value_aliases: int) -> Self:  # noqa: ARG004
         self = int.__new__(cls, value)
         self._value_ = value
         return self
-    
-    def __init__(self, value: int, *value_aliases: int) -> None:
+
+    def __init__(self, value: int, *value_aliases: int) -> None:  # noqa: ARG002
         super().__init__()
 
         for v_alias in value_aliases:
             self._add_value_alias_(v_alias)
 
     @classmethod
-    def _missing_(cls, value: object) -> "ResponseCode":  # noqa: ARG003
+    def _missing_(cls, value: object) -> ResponseCode:  # noqa: ARG003
         """
         Set the default error code to RESERVED when an unknown code is encountered.
 
@@ -257,7 +259,7 @@ class CRDeviceBase(ABC):
 
         for p in port_list:
             try:
-                device = p.device  # type: ignore
+                device = p.device
                 sp = serial.Serial(device, **_CR_SERIAL_KWARGS)
                 sp.readall()
                 sp.write(b"RC InstrumentType\n")
