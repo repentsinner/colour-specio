@@ -9,7 +9,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum, IntEnum
+from enum import Enum
 from functools import cached_property
 from types import MappingProxyType
 from typing import Any, Self
@@ -26,6 +26,9 @@ __maintainer__ = "Tucker Downs"
 __email__ = "tucker@tjdcs.dev"
 __status__ = "Development"
 
+_MAX_AVERAGE_SAMPLES = 50
+"""The exposure multiplier's upper bound, per the CR command set."""
+
 __all__ = [
     "CRDeviceBase",
     "CommandError",
@@ -35,6 +38,7 @@ __all__ = [
     "Model",
     "ResponseCode",
     "ResponseType",
+    "UnexpectedResponse",
 ]
 
 
@@ -143,11 +147,11 @@ class ResponseCode(int, Enum):
 
     RESERVED = -999
 
-    def __new__(cls, value: int, *value_aliases: int) -> Self: # type: ignore
+    def __new__(cls, value: int, *value_aliases: int) -> Self:  # type: ignore
         self = int.__new__(cls, value)
         self._value_ = value
         return self
-    
+
     def __init__(self, value: int, *value_aliases: int) -> None:
         super().__init__()
 
@@ -213,6 +217,26 @@ class IncompleteResponse(Exception):
         )
 
 
+class UnexpectedResponse(Exception):
+    """The device answered, but not with the value the command asked for.
+
+    Distinct from `IncompleteResponse`, which is the absence of an answer,
+    and from `CommandError`, which is a refusal the device chose to send.
+    This is a reply whose content does not fit the question -- the
+    signature of a desynchronized link, where each read returns the
+    previous command's answer. Raising it by name stops a stale value
+    being cast into a number and used as if it were fresh.
+    """
+
+    def __init__(self, command: str, value: object) -> None:
+        self.command = command
+        self.value = value
+        super().__init__(
+            f"{command!r} answered {value!r}, which is not the value that "
+            "command returns; the link is one reply behind"
+        )
+
+
 class CRDeviceBase(ABC):
     """
     Abstract base class for Colorimetry Research devices.
@@ -237,6 +261,11 @@ class CRDeviceBase(ABC):
         """
         self.__last_cmd_time: float = 0
         self.__last_command: str = ""
+        # The device is asked once. A measurement needs this to size its
+        # own timeout, and querying the instrument from inside the measure
+        # path meant a property read could abort a measurement that had
+        # not started -- and did, on a display too dark to read.
+        self.__average_samples: int | None = None
         if isinstance(port, str):
             self._port = serial.Serial(port, **_CR_SERIAL_KWARGS)
 
@@ -377,8 +406,18 @@ class CRDeviceBase(ABC):
         CommandError
             If the exposure multiplier query command fails.
         """
+        if self.__average_samples is not None:
+            return self.__average_samples
+
         response = self._write_cmd("RS ExposureX")
-        return int(response.arguments[0])
+        raw = response.arguments[0] if response.arguments else ""
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as e:
+            raise UnexpectedResponse("RS ExposureX", raw) from e
+
+        self.__average_samples = value
+        return value
 
     @average_samples.setter
     def average_samples(self, num: int) -> None:
@@ -396,8 +435,9 @@ class CRDeviceBase(ABC):
             If the exposure multiplier setting command fails.
         """
         num = num if num > 0 else 1
-        num = num if num < 50 else 50
+        num = num if num < _MAX_AVERAGE_SAMPLES else _MAX_AVERAGE_SAMPLES
         self._write_cmd(f"SM ExposureX {num:d}")
+        self.__average_samples = num
 
     @property
     def instrument_type(self) -> InstrumentType:
@@ -503,6 +543,7 @@ class CRDeviceBase(ABC):
         """
         log = logging.getLogger("specio.CR")
         log.debug("resynchronizing the CR link")
+        self.__average_samples = None
         try:
             self._port.reset_input_buffer()
             self._port.reset_output_buffer()
