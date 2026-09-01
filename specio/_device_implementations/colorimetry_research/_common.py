@@ -9,7 +9,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum, IntEnum
+from enum import Enum
 from functools import cached_property
 from types import MappingProxyType
 from typing import Any, Self
@@ -27,10 +27,13 @@ __email__ = "tucker@tjdcs.dev"
 __status__ = "Development"
 
 __all__ = [
+    "OUT_OF_RANGE_CODES",
     "CRDeviceBase",
     "CommandError",
     "CommandResponse",
+    "IncompleteResponse",
     "InstrumentType",
+    "MeasurementOutOfRange",
     "Model",
     "ResponseCode",
     "ResponseType",
@@ -146,7 +149,7 @@ class ResponseCode(int, Enum):
         self = int.__new__(cls, value)
         self._value_ = value
         return self
-    
+
     def __init__(self, value: int, *value_aliases: int) -> None:
         super().__init__()
 
@@ -183,6 +186,15 @@ class CommandResponse:
     arguments: list[str]
 
 
+class IncompleteResponse(Exception):
+    """The device sent something that is not a reply.
+
+    Distinct from `CommandError`, which carries a reply the device meant
+    to send. This is a truncated or empty read — the link stumbled — and
+    is the one condition here that a caller should retry.
+    """
+
+
 class CommandError(Exception):
     """
     Describes an issue with sending a command to CR
@@ -191,6 +203,41 @@ class CommandError(Exception):
     def __init__(self, response: CommandResponse, *args: object) -> None:
         self.response = response
         super().__init__(*args)
+
+    @property
+    def code(self) -> ResponseCode:
+        """The device's own code for what went wrong."""
+        return self.response.code
+
+
+class MeasurementOutOfRange(CommandError):
+    """The device measured, and the light is outside what it can report.
+
+    A distinct type because it is a *result*, not a failure to obtain
+    one. The instrument integrated, decided the target sits below its
+    floor or above its ceiling, and said so — which is the correct
+    answer to "how much light is there", and nothing a caller retries
+    its way out of.
+
+    Callers act on it rather than swallow it: a session that meets this
+    at the bottom of a display's range routes the patch to a more
+    sensitive instrument, and one that meets it at the top has an
+    aperture or a filter problem. Retrying instead spends the
+    integration again to be told the same true thing.
+    """
+
+
+# The codes that mean "measured, and out of range" rather than "the
+# exchange went wrong". Colorimetry Research distinguishes them; this
+# library did not, so every caller saw one opaque CommandError.
+OUT_OF_RANGE_CODES = frozenset(
+    {
+        ResponseCode.TOO_DARK,
+        ResponseCode.LIGHT_INTENSITY_TOO_LOW,
+        ResponseCode.LIGHT_INTENSITY_UNMEASURABLE,
+        ResponseCode.LIGHT_INTENSITY_TOO_HIGH,
+    }
+)
 
 
 class CRDeviceBase(ABC):
@@ -453,7 +500,18 @@ class CRDeviceBase(ABC):
         response = self._parse_response(response)
 
         if response.type == ResponseType.ERROR:
-            raise CommandError(response, response.arguments[0])
+            # The device does not always attach an argument to an error,
+            # and indexing one that is not there turned the device's
+            # report into an IndexError from inside this library — the
+            # caller then saw a crash where the instrument had sent a
+            # perfectly clear message. Fall back to the description it
+            # always sends.
+            detail = (
+                response.arguments[0] if response.arguments else response.description
+            )
+            if response.code in OUT_OF_RANGE_CODES:
+                raise MeasurementOutOfRange(response, detail)
+            raise CommandError(response, detail)
         else:
             return response
 
@@ -472,10 +530,21 @@ class CRDeviceBase(ABC):
             Structured response containing parsed type, code, description and arguments.
         """
         response = data.strip().split(b":")
+        if len(response) < 3:
+            raise IncompleteResponse(
+                f"the device sent {data!r}, which is not a response: a reply "
+                "is at least type, code and description separated by colons"
+            )
 
         args = []
+        # A device error carries no fourth field at all — `E:100:M` is a
+        # complete reply meaning "too dark". Reading past it turned the
+        # instrument's own report into an IndexError raised from inside
+        # this library, so a caller saw a crash where the device had said
+        # something clear. Observed on a CR-300 reading a capped aperture.
         if (
-            response[3].decode().isnumeric()
+            len(response) > 3
+            and response[3].decode().isnumeric()
             and int(response[3]) > 0
             and self._port.in_waiting
         ):
