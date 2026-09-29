@@ -46,12 +46,12 @@ class _Device(CRDeviceBase):
         self._CRDeviceBase__average_samples = None
 
     # The two hooks the base class needs, stubbed.
-    def _write_cmd(self, command: str):  # type: ignore[override]
+    def _write_cmd(self, command: str):
         self.sent.append(command)
         raw = self._replies.pop(0)
         return self._parse_response(raw)
 
-    def resync(self) -> None:  # type: ignore[override]
+    def resync(self) -> None:
         self.resyncs += 1
         self._CRDeviceBase__average_samples = None
 
