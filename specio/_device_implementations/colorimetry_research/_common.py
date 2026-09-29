@@ -147,12 +147,12 @@ class ResponseCode(int, Enum):
 
     RESERVED = -999
 
-    def __new__(cls, value: int, *value_aliases: int) -> Self:  # type: ignore
+    def __new__(cls, value: int, *value_aliases: int) -> Self:  # noqa: ARG004
         self = int.__new__(cls, value)
         self._value_ = value
         return self
 
-    def __init__(self, value: int, *value_aliases: int) -> None:
+    def __init__(self, value: int, *value_aliases: int) -> None:  # noqa: ARG002
         super().__init__()
 
         for v_alias in value_aliases:
