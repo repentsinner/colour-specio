@@ -16,7 +16,7 @@ from colour import SpectralDistribution
 from specio.common import RawSPDMeasurement, SpecRadiometer
 from specio.common.exceptions import DeviceError
 
-from ._common import PRDeviceBase
+from ._common import _COMMAND_TERMINATOR, MeasurementOutOfRange, PRDeviceBase
 
 __version__ = "0.4.1.post0"
 __author__ = "Tucker Downs"
@@ -27,6 +27,7 @@ __email__ = "tucker@tjdcs.dev"
 __status__ = "Development"
 
 __all__ = [
+    "FLOOR_SOURCE_NOMINAL",
     "PRSpectrometer",
 ]
 
@@ -38,8 +39,23 @@ _MAX_AVERAGE_SAMPLES = 99
 
 # Field positions in the D602 verbose setup report, counted after the
 # error code (PR-655/670 User Manual, p.148).
+_D602_PRIMARY_ACCESSORY_FIELD = 0
+_D602_ADDON_FIELDS = (1, 2, 3)
+_D602_APERTURE_FIELD = 4
+_D602_EXPOSURE_MODE_FIELD = 6
 _D602_EXPOSURE_TIME_FIELD = 7
 _D602_CYCLES_FIELD = 9
+
+# The lowest luminance each optical setup reports, in cd/m², from the
+# PR-655/670 User Manual's "PR-655 Sensitivity Chart" (Table 12). Keyed
+# by (primary accessory, aperture) with no add-on fitted; only the rows
+# that read unambiguously off the chart are carried. Any other setup
+# states no floor rather than a guess.
+_NOMINAL_FLOORS: dict[tuple[str, str], float] = {
+    ("MS-75", "1 deg"): 3.4,
+}
+
+FLOOR_SOURCE_NOMINAL = "nominal: PR-655/670 User Manual, Table 12"
 
 _LEADING_NUMBER = re.compile(r"\s*(\d+(?:\.\d+)?)")
 _MSEC_VALUE = re.compile(r"(\d+(?:\.\d+)?)\s*msec")
@@ -98,10 +114,12 @@ class PRSpectrometer(PRDeviceBase, SpecRadiometer):
         """
         Get the exposure (integration) time setting in seconds.
 
-        Reads the verbose setup report (D602). In adaptive mode the report
-        gives an exposure time of 0, so the getter returns
-        :attr:`ADAPTIVE_EXPOSURE`. The integration time that adaptive mode
-        chose for a measurement is in that measurement's ``exposure``.
+        Reads the verbose setup report (D602), whose exposure-mode field
+        reads ``Adaptive`` or ``Fixed``. In adaptive mode the getter returns
+        :attr:`ADAPTIVE_EXPOSURE`: the time field then holds the last fixed
+        exposure (or the minimum), not one in force. The integration time
+        adaptive mode chose for a measurement is in that measurement's
+        ``exposure``.
 
         Returns
         -------
@@ -115,10 +133,12 @@ class PRSpectrometer(PRDeviceBase, SpecRadiometer):
         DeviceError
             If the report has no readable exposure time.
         """
-        report = self._write_cmd("D602").raw_data
+        report = self._setup_report()
         fields = report.split(",")
         if len(fields) <= _D602_EXPOSURE_TIME_FIELD:
             raise DeviceError(f"Malformed Photo Research setup report: {report!r}")
+        if fields[_D602_EXPOSURE_MODE_FIELD].strip().lower() == "adaptive":
+            return self.ADAPTIVE_EXPOSURE
         milliseconds = _leading_number(fields[_D602_EXPOSURE_TIME_FIELD], report)
         return milliseconds / _MS_PER_SECOND
 
@@ -168,7 +188,7 @@ class PRSpectrometer(PRDeviceBase, SpecRadiometer):
         DeviceError
             If the report has no readable cycle count.
         """
-        report = self._write_cmd("D602").raw_data
+        report = self._setup_report()
         fields = report.split(",")
         if len(fields) <= _D602_CYCLES_FIELD:
             raise DeviceError(f"Malformed Photo Research setup report: {report!r}")
@@ -271,13 +291,71 @@ class PRSpectrometer(PRDeviceBase, SpecRadiometer):
             raise DeviceError(f"Malformed Photo Research D13 report: {report!r}")
         return float(match.group(1)) / _MS_PER_SECOND
 
+    def _setup_report(self) -> str:
+        """
+        The verbose setup report (D602), read whole.
+
+        A bench PR-655 (firmware 2.51) sends the report's first 64 bytes,
+        one USB packet, and holds the rest until the host next writes, so
+        the tail would otherwise arrive inside the next command's reply. A
+        bare terminator releases it: the tail is appended here, and the
+        device's answer to the empty line that follows it is discarded.
+
+        Returns
+        -------
+        str
+            The report's fields after the error code, comma separated.
+        """
+        report = self._write_cmd("D602").raw_data
+        self._write_serial(_COMMAND_TERMINATOR)
+        tail = self._read_response()
+        if tail and not tail.lstrip("+-").split(",")[0].isdigit():
+            report += tail
+            self._read_response()
+        return report
+
+    @cached_property
+    def floor(self) -> float | None:
+        """
+        The lowest luminance the current optical setup reports, in cd/m².
+
+        Read from the verbose setup report (D602: primary accessory,
+        add-ons, aperture) and looked up in the manual's sensitivity
+        chart. The device can return readings below it: it is the
+        manufacturer's stated range, not where this unit refuses.
+
+        Returns
+        -------
+        float | None
+            The stated floor, or None when the setup is not one the chart
+            states unambiguously, or the report cannot be read.
+        """
+        try:
+            fields = self._setup_report().split(",")
+        except DeviceError:
+            return None
+        if len(fields) <= _D602_APERTURE_FIELD:
+            return None
+        if any(fields[i].strip() != "None" for i in _D602_ADDON_FIELDS):
+            return None
+        primary = fields[_D602_PRIMARY_ACCESSORY_FIELD].strip()
+        aperture = fields[_D602_APERTURE_FIELD].strip()
+        return _NOMINAL_FLOORS.get((primary, aperture))
+
+    @property
+    def floor_source(self) -> str | None:
+        """Where :attr:`floor` comes from, or None when there is no floor."""
+        return FLOOR_SOURCE_NOMINAL if self.floor is not None else None
+
     def _raw_measure(self) -> RawSPDMeasurement:
         """
         Perform a spectral measurement and return raw spectral data.
 
-        Triggers a measurement (M0), then retrieves the spectrum (D5). D5
-        returns a header line, then one ``wavelength,value`` line per
-        spectral point. The spectral domain comes from those wavelengths,
+        Triggers a measurement that returns its spectrum (M5): a header
+        line, then one ``wavelength,value`` line per spectral point. M0
+        followed by D5 is not used: a bench PR-655 (firmware 2.51) streams
+        the whole spectrum in reply to M0 as well, and the D5 sent after it
+        collides with that stream. The spectral domain comes from those wavelengths,
         and D13 supplies the exposure time the measurement used.
 
         Returns
@@ -288,6 +366,9 @@ class PRSpectrometer(PRDeviceBase, SpecRadiometer):
 
         Raises
         ------
+        MeasurementOutOfRange
+            If the light is outside the device's range; a too-dark refusal
+            carries the floor the device states for its setup.
         PRCommandError
             If the measurement or data retrieval command returns an error.
         DeviceError
@@ -297,11 +378,14 @@ class PRSpectrometer(PRDeviceBase, SpecRadiometer):
         points = self._spectral_points
         spectrometer_id = self.readable_id
 
-        log.debug("Triggering spectral measurement (M0)")
-        self._write_cmd("M0", timeout=_MEASUREMENT_TIMEOUT)
+        log.debug("Measuring and returning the spectrum (M5)")
+        try:
+            self._write_cmd("M5", timeout=_MEASUREMENT_TIMEOUT)
+        except MeasurementOutOfRange as e:
+            if e.too_dark:
+                e.floor, e.floor_source = self.floor, self.floor_source
+            raise
 
-        log.debug("Retrieving spectral data (D5)")
-        self._write_cmd("D5")
         wavelengths, values = self._read_spectrum(points)
         exposure = self._last_exposure()
 
